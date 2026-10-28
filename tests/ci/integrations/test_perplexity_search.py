@@ -332,9 +332,10 @@ async def test_perplexity_search_unexpected_response_shape(httpserver, monkeypat
 	assert 'string item' not in perplexity_log.text
 
 
-async def test_perplexity_search_missing_results_key_is_empty(httpserver, monkeypatch):
-	"""A dict without a results key (or results: null) is treated as zero results, not an error."""
-	httpserver.expect_request('/search', method='POST').respond_with_json({'id': 'x', 'results': None})
+@pytest.mark.parametrize('payload', [{'id': 'x'}, {'id': 'x', 'results': None}])
+async def test_perplexity_search_missing_or_null_results_is_empty(httpserver, monkeypatch, payload):
+	"""A dict with no results key, or results: null, is treated as zero results, not an error."""
+	httpserver.expect_request('/search', method='POST').respond_with_json(payload)
 	_point_client_at(httpserver, monkeypatch)
 
 	result = await search_perplexity('null results')
