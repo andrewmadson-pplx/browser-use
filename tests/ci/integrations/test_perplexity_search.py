@@ -250,3 +250,93 @@ async def test_perplexity_search_does_not_echo_response_body(httpserver, monkeyp
 	assert sentinel not in result.error
 	assert sentinel not in perplexity_log.text
 	assert 'Perplexity Search API returned HTTP 500' in perplexity_log.text
+
+
+@pytest.mark.parametrize(
+	('status', 'hint'),
+	[
+		(422, 'invalid request parameters'),
+		(429, 'rate limited, retry later'),
+	],
+)
+async def test_perplexity_search_422_and_429_use_fixed_hint(httpserver, monkeypatch, perplexity_log, status, hint):
+	"""422 and 429 responses produce a fixed-hint error; the response body is never echoed."""
+	body_sentinel = f'BODY-SENTINEL-{status}'
+	httpserver.expect_request('/search', method='POST').respond_with_json(
+		{'detail': [{'msg': body_sentinel, 'loc': ['body', 'max_results']}]}, status=status
+	)
+	_point_client_at(httpserver, monkeypatch)
+
+	result = await search_perplexity('error query')
+
+	assert result.extracted_content is None
+	assert result.error == f'Failed to search Perplexity for "error query": HTTP {status} {hint}'
+	assert body_sentinel not in result.error
+	assert body_sentinel not in perplexity_log.text
+	assert f'Perplexity Search API returned HTTP {status} ({hint})' in perplexity_log.text
+
+
+async def test_perplexity_search_malformed_json_body(httpserver, monkeypatch, perplexity_log):
+	"""A 200 with a non-JSON body takes the ValueError path: fixed message naming only the
+	exception class, with none of the body or the exception text in the error or the logs."""
+	body_sentinel = 'NOT-JSON-SENTINEL <html>oops</html>'
+	httpserver.expect_request('/search', method='POST').respond_with_data(body_sentinel, status=200, content_type='text/html')
+	_point_client_at(httpserver, monkeypatch)
+
+	result = await search_perplexity('bad body')
+
+	assert result.extracted_content is None
+	assert result.error == 'Failed to search Perplexity for "bad body": JSONDecodeError'
+	assert 'Perplexity Search API request failed: JSONDecodeError' in perplexity_log.text
+	for leaked in (body_sentinel, 'Expecting value', 'line 1'):
+		assert leaked not in result.error
+		assert leaked not in perplexity_log.text
+
+
+async def test_perplexity_search_malformed_base_url(monkeypatch, perplexity_log):
+	"""httpx.InvalidURL is not an HTTPError. A malformed PERPLEXITY_BASE_URL must still produce the
+	fixed class-name-only error, with no URL fragment in the error or the logs."""
+	monkeypatch.setenv('PERPLEXITY_API_KEY', 'test-key')
+	monkeypatch.setenv('PERPLEXITY_BASE_URL', 'http://[::1')
+
+	result = await search_perplexity('bad base url')
+
+	assert result.extracted_content is None
+	assert result.error == 'Failed to search Perplexity for "bad base url": InvalidURL'
+	assert 'Perplexity Search API request failed: InvalidURL' in perplexity_log.text
+	for leaked in ('[::1', 'Invalid port', 'test-key'):
+		assert leaked not in result.error
+		assert leaked not in perplexity_log.text
+
+
+@pytest.mark.parametrize(
+	'payload',
+	[
+		['not', 'a', 'dict'],
+		{'results': 'not a list'},
+		{'results': {'title': 'dict instead of list'}},
+		{'results': ['string item', {'title': 'ok', 'url': 'https://example.com', 'snippet': 'x'}]},
+	],
+)
+async def test_perplexity_search_unexpected_response_shape(httpserver, monkeypatch, perplexity_log, payload):
+	"""A JSON body that is not {results: [dict, ...]} produces a fixed error, not a traceback."""
+	httpserver.expect_request('/search', method='POST').respond_with_json(payload)
+	_point_client_at(httpserver, monkeypatch)
+
+	result = await search_perplexity('odd shape')
+
+	assert result.extracted_content is None
+	assert result.error == 'Failed to search Perplexity for "odd shape": unexpected response shape'
+	assert 'not a list' not in perplexity_log.text
+	assert 'string item' not in perplexity_log.text
+
+
+async def test_perplexity_search_missing_results_key_is_empty(httpserver, monkeypatch):
+	"""A dict without a results key (or results: null) is treated as zero results, not an error."""
+	httpserver.expect_request('/search', method='POST').respond_with_json({'id': 'x', 'results': None})
+	_point_client_at(httpserver, monkeypatch)
+
+	result = await search_perplexity('null results')
+
+	assert result.error is None
+	assert '0 results' in (result.extracted_content or '')

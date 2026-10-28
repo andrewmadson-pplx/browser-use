@@ -21,9 +21,8 @@ async def search_perplexity(
 	no page navigation. Requires a ``PERPLEXITY_API_KEY`` environment variable.
 	``PERPLEXITY_BASE_URL`` overrides the API host (used by tests and proxies).
 
-	``max_tokens_per_page`` caps the snippet length per result; the API default
-	(~1024 tokens per result) would put ~10k tokens into the agent context per
-	search, so we default to a much smaller value here.
+	``max_tokens_per_page`` caps the snippet length per result. The API default is
+	much larger than an agent step needs, so a smaller value is sent by default.
 	"""
 	assert 1 <= max_results <= 20, 'max_results must be between 1 and 20'
 	assert search_type in ('web', 'fast'), "search_type must be 'web' or 'fast'"
@@ -63,12 +62,20 @@ async def search_perplexity(
 		)
 		logger.error(f'Perplexity Search API returned HTTP {status} ({hint})')
 		return ActionResult(error=f'Failed to search Perplexity for "{query}": HTTP {status} {hint}')
-	except (httpx.HTTPError, ValueError) as e:
-		# HTTPError covers transport, timeout, and protocol errors; ValueError covers a non-JSON body.
+	except Exception as e:
+		# httpx.HTTPError (transport, timeout, protocol), httpx.InvalidURL (bad PERPLEXITY_BASE_URL,
+		# not an HTTPError subclass), ValueError (non-JSON body), and anything else: report the class
+		# name only, so no URL fragment or header value can reach the agent via the registry.
 		logger.error(f'Perplexity Search API request failed: {type(e).__name__}')
 		return ActionResult(error=f'Failed to search Perplexity for "{query}": {type(e).__name__}')
 
-	results = data.get('results') or []
+	results = data.get('results') if isinstance(data, dict) else None
+	if isinstance(data, dict) and results is None:
+		results = []
+	if not isinstance(results, list) or not all(isinstance(r, dict) for r in results):
+		logger.error('Perplexity Search API returned an unexpected response shape')
+		return ActionResult(error=f'Failed to search Perplexity for "{query}": unexpected response shape')
+
 	memory = f"Searched Perplexity for '{query}' ({len(results)} results)"
 	if not results:
 		return ActionResult(extracted_content=memory, long_term_memory=memory)
