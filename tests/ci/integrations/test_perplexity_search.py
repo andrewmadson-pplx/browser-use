@@ -270,6 +270,7 @@ async def test_perplexity_search_422_and_429_use_fixed_hint(httpserver, monkeypa
 	result = await search_perplexity('error query')
 
 	assert result.extracted_content is None
+	assert result.error is not None
 	assert result.error == f'Failed to search Perplexity for "error query": HTTP {status} {hint}'
 	assert body_sentinel not in result.error
 	assert body_sentinel not in perplexity_log.text
@@ -305,6 +306,7 @@ async def test_perplexity_search_malformed_base_url(monkeypatch, perplexity_log)
 	assert result.error == 'Failed to search Perplexity for "bad base url": InvalidURL'
 	assert 'Perplexity Search API request failed: InvalidURL' in perplexity_log.text
 	for leaked in ('[::1', 'Invalid port', 'test-key'):
+		assert leaked not in result.error
 		assert leaked not in perplexity_log.text
 
 
