@@ -1,18 +1,22 @@
-"""Tests for the Perplexity Search API engine on the native ``search`` action.
+"""Tests for the Perplexity Search API engine (``browser_use.integrations.perplexity``) on the
+native ``search`` action.
 
 Per the repo's testing rules these use real objects: the real ``httpx`` call in
-``_search_perplexity`` is pointed at a local ``pytest-httpserver`` via the
+``search_perplexity`` is pointed at a local ``pytest-httpserver`` via the
 ``PERPLEXITY_BASE_URL`` env var. No mocks, no real network.
 """
 
 import json
+import logging
 
 import pytest
 from pytest_httpserver import HTTPServer
 
 from browser_use import BrowserProfile, BrowserSession
 from browser_use.agent.views import ActionResult
-from browser_use.tools.service import Tools, _search_perplexity
+from browser_use.integrations.perplexity import search_perplexity
+from browser_use.integrations.perplexity.search import logger as perplexity_logger
+from browser_use.tools.service import Tools
 
 
 def _search_payload() -> dict:
@@ -34,6 +38,33 @@ def _search_payload() -> dict:
 			},
 		],
 	}
+
+
+class _RecordingHandler(logging.Handler):
+	"""Captures what the integration logger emits. browser_use loggers do not propagate to root,
+	so pytest's caplog does not see them; attach directly instead."""
+
+	def __init__(self) -> None:
+		super().__init__(level=logging.DEBUG)
+		self.lines: list[str] = []
+
+	def emit(self, record: logging.LogRecord) -> None:
+		self.lines.append(record.getMessage())
+
+	@property
+	def text(self) -> str:
+		return '\n'.join(self.lines)
+
+
+@pytest.fixture
+def perplexity_log():
+	handler = _RecordingHandler()
+	previous_level = perplexity_logger.level
+	perplexity_logger.addHandler(handler)
+	perplexity_logger.setLevel(logging.DEBUG)
+	yield handler
+	perplexity_logger.removeHandler(handler)
+	perplexity_logger.setLevel(previous_level)
 
 
 def _point_client_at(httpserver: HTTPServer, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -120,7 +151,7 @@ async def test_perplexity_search_returns_structured_results(httpserver, monkeypa
 	httpserver.expect_request('/search', method='POST').respond_with_json(_search_payload())
 	_point_client_at(httpserver, monkeypatch)
 
-	result = await _search_perplexity('browser use release notes')
+	result = await search_perplexity('browser use release notes')
 
 	assert result.error is None
 	assert result.extracted_content is not None
@@ -136,7 +167,7 @@ async def test_perplexity_search_passes_parameters(httpserver, monkeypatch):
 	httpserver.expect_request('/search', method='POST').respond_with_json(_search_payload())
 	_point_client_at(httpserver, monkeypatch)
 
-	result = await _search_perplexity('fast query', max_results=3, search_type='fast')
+	result = await search_perplexity('fast query', max_results=3, search_type='fast')
 	assert result.error is None
 	request, _ = httpserver.log[-1]
 	assert json.loads(request.get_data()) == {
@@ -147,9 +178,9 @@ async def test_perplexity_search_passes_parameters(httpserver, monkeypatch):
 	}
 
 	with pytest.raises(AssertionError):
-		await _search_perplexity('too many', max_results=21)
+		await search_perplexity('too many', max_results=21)
 	with pytest.raises(AssertionError):
-		await _search_perplexity('bad type', search_type='people')
+		await search_perplexity('bad type', search_type='people')
 
 
 async def test_perplexity_search_handles_empty_results(httpserver, monkeypatch):
@@ -157,7 +188,7 @@ async def test_perplexity_search_handles_empty_results(httpserver, monkeypatch):
 	httpserver.expect_request('/search', method='POST').respond_with_json({'id': 'x', 'results': []})
 	_point_client_at(httpserver, monkeypatch)
 
-	result = await _search_perplexity('obscure query with no hits')
+	result = await search_perplexity('obscure query with no hits')
 
 	assert result.error is None
 	assert '0 results' in (result.extracted_content or '')
@@ -168,9 +199,54 @@ async def test_perplexity_search_http_error_returns_friendly_error(httpserver, m
 	httpserver.expect_request('/search', method='POST').respond_with_json({'detail': 'Unauthorized'}, status=401)
 	_point_client_at(httpserver, monkeypatch)
 
-	result = await _search_perplexity('anything')
+	result = await search_perplexity('anything')
 
 	assert result.extracted_content is None
 	assert result.error is not None
 	assert 'HTTP 401' in result.error
 	assert 'PERPLEXITY_API_KEY' in result.error
+
+
+async def test_perplexity_search_never_leaks_api_key(httpserver, monkeypatch, perplexity_log):
+	"""A key with a trailing newline is stripped and used as-is; a key that is still an illegal
+	header value makes httpx raise with the full Authorization header in the exception text,
+	which must not reach ActionResult.error or the logs."""
+	httpserver.expect_request('/search', method='POST').respond_with_json(_search_payload())
+	monkeypatch.setenv('PERPLEXITY_BASE_URL', httpserver.url_for('/').rstrip('/'))
+
+	# Trailing newline (common when the key is read from a file): stripped, request succeeds.
+	monkeypatch.setenv('PERPLEXITY_API_KEY', 'pplx-secret-trailing\n')
+	result = await search_perplexity('newline key')
+	assert result.error is None
+	request, _ = httpserver.log[-1]
+	assert request.headers.get('Authorization') == 'Bearer pplx-secret-trailing'
+
+	# Embedded newline cannot be fixed by strip(): httpx raises LocalProtocolError whose message
+	# contains the raw header value. The error must be a fixed string with no key material.
+	perplexity_log.lines.clear()
+	monkeypatch.setenv('PERPLEXITY_API_KEY', 'pplx-secret\nembedded')
+	result = await search_perplexity('second query')
+
+	assert result.extracted_content is None
+	assert result.error is not None
+	assert 'LocalProtocolError' in result.error
+	assert 'LocalProtocolError' in perplexity_log.text
+	for leaked in ('pplx-secret', 'Bearer', 'embedded'):
+		assert leaked not in result.error
+		assert leaked not in perplexity_log.text
+
+
+async def test_perplexity_search_does_not_echo_response_body(httpserver, monkeypatch, perplexity_log):
+	"""Error response bodies are never copied into logs or ActionResult (they can echo request
+	headers); only the status code and a fixed hint are reported."""
+	sentinel = 'SENTINEL-DO-NOT-LOG-Bearer-test-key'
+	httpserver.expect_request('/search', method='POST').respond_with_data(sentinel, status=500)
+	_point_client_at(httpserver, monkeypatch)
+
+	result = await search_perplexity('server error')
+
+	assert result.extracted_content is None
+	assert result.error == 'Failed to search Perplexity for "server error": HTTP 500 request failed'
+	assert sentinel not in result.error
+	assert sentinel not in perplexity_log.text
+	assert 'Perplexity Search API returned HTTP 500' in perplexity_log.text
