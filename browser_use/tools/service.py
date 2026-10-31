@@ -32,6 +32,7 @@ from browser_use.browser.events import (
 from browser_use.browser.views import BrowserError
 from browser_use.dom.service import EnhancedDOMTreeNode
 from browser_use.filesystem.file_system import FileSystem
+from browser_use.integrations.perplexity import search_perplexity
 from browser_use.llm.base import BaseChatModel
 from browser_use.llm.messages import SystemMessage, UserMessage
 from browser_use.observability import observe_debug
@@ -461,6 +462,9 @@ class Tools(Generic[Context]):
 			terminates_sequence=True,
 		)
 		async def search(params: SearchAction, browser_session: BrowserSession):
+			if params.engine.lower() == 'perplexity':
+				return await search_perplexity(params.query)
+
 			import urllib.parse
 
 			# Encode query for URL safety
@@ -474,7 +478,9 @@ class Tools(Generic[Context]):
 			}
 
 			if params.engine.lower() not in search_engines:
-				return ActionResult(error=f'Unsupported search engine: {params.engine}. Options: duckduckgo, google, bing')
+				return ActionResult(
+					error=f'Unsupported search engine: {params.engine}. Options: duckduckgo, google, bing, perplexity'
+				)
 
 			search_url = search_engines[params.engine.lower()]
 

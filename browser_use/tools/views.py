@@ -49,7 +49,8 @@ class FindElementsAction(BaseModel):
 class SearchAction(BaseModel):
 	query: str
 	engine: str = Field(
-		default='duckduckgo', description='duckduckgo, google, bing (use duckduckgo by default because less captchas)'
+		default='duckduckgo',
+		description='duckduckgo, google, bing (use duckduckgo by default because less captchas), or perplexity for an API-backed search that returns results without browser navigation (only when PERPLEXITY_API_KEY is configured)',
 	)
 
 
