@@ -1,9 +1,7 @@
 """Tests for the Perplexity Search API engine (``browser_use.integrations.perplexity``) on the
 native ``search`` action.
 
-Per the repo's testing rules these use real objects: the real ``httpx`` call in
-``search_perplexity`` is pointed at a local ``pytest-httpserver`` via the
-``PERPLEXITY_BASE_URL`` env var. No mocks, no real network.
+Uses httpx against a local pytest-httpserver. No external Search API calls are made.
 """
 
 import json
@@ -14,9 +12,11 @@ from pytest_httpserver import HTTPServer
 
 from browser_use import BrowserProfile, BrowserSession
 from browser_use.agent.views import ActionResult
+from browser_use.browser.events import NavigateToUrlEvent
 from browser_use.integrations.perplexity import search_perplexity
 from browser_use.integrations.perplexity.search import logger as perplexity_logger
 from browser_use.tools.service import Tools
+from browser_use.utils import get_browser_use_version
 
 
 def _search_payload() -> dict:
@@ -73,9 +73,6 @@ def _point_client_at(httpserver: HTTPServer, monkeypatch: pytest.MonkeyPatch) ->
 	monkeypatch.setenv('PERPLEXITY_BASE_URL', httpserver.url_for('/').rstrip('/'))
 
 
-# Real registry + real (headless) browser, mirroring tests/ci/test_search_find.py.
-
-
 @pytest.fixture(scope='module')
 async def browser_session():
 	session = BrowserSession(browser_profile=BrowserProfile(headless=True, user_data_dir=None, keep_alive=True))
@@ -99,6 +96,7 @@ async def test_search_action_perplexity_engine_returns_results_inline(tools, bro
 	_point_client_at(httpserver, monkeypatch)
 
 	url_before = await browser_session.get_current_page_url()
+	events_before = set(browser_session.event_bus.event_history)
 	result = await tools.search(query='browser use release notes', engine='perplexity', browser_session=browser_session)
 
 	assert isinstance(result, ActionResult)
@@ -109,28 +107,39 @@ async def test_search_action_perplexity_engine_returns_results_inline(tools, bro
 	assert 'https://example.com/two' in result.extracted_content
 	assert '2 results' in (result.long_term_memory or '')
 
-	# The perplexity path returns before any NavigateToUrlEvent, so the browser does not move.
 	assert await browser_session.get_current_page_url() == url_before
+	assert not any(
+		isinstance(event, NavigateToUrlEvent)
+		for event_id, event in browser_session.event_bus.event_history.items()
+		if event_id not in events_before
+	)
 
-	# The request really reached the API with the expected body and headers.
 	request, _ = httpserver.log[-1]
 	assert request.headers.get('Authorization') == 'Bearer test-key'
 	assert request.headers.get('X-Pplx-Integration') == 'browser-use'
-	assert request.headers.get('User-Agent', '').startswith('browser-use/')
+	assert request.headers.get('User-Agent') == f'browser-use/{get_browser_use_version()}'
 	body = json.loads(request.get_data())
 	assert body == {'query': 'browser use release notes', 'max_results': 10, 'search_type': 'web', 'max_tokens_per_page': 256}
 
 
-async def test_search_action_perplexity_missing_key(tools, browser_session, monkeypatch):
-	"""Through the action: no key -> friendly error, no API call, no navigation."""
+async def test_search_action_perplexity_missing_key(tools, browser_session, httpserver, monkeypatch):
+	"""Reject a missing key before making a search request or navigating."""
+	_point_client_at(httpserver, monkeypatch)
 	monkeypatch.delenv('PERPLEXITY_API_KEY', raising=False)
 
 	url_before = await browser_session.get_current_page_url()
+	events_before = set(browser_session.event_bus.event_history)
 	result = await tools.search(query='anything', engine='perplexity', browser_session=browser_session)
 
-	assert result.error == 'PERPLEXITY_API_KEY environment variable not set'
+	assert result.error == 'Set PERPLEXITY_API_KEY to use engine="perplexity".'
 	assert result.extracted_content is None
+	assert not httpserver.log
 	assert await browser_session.get_current_page_url() == url_before
+	assert not any(
+		isinstance(event, NavigateToUrlEvent)
+		for event_id, event in browser_session.event_bus.event_history.items()
+		if event_id not in events_before
+	)
 
 
 async def test_search_action_unknown_engine_errors(tools, browser_session):
@@ -167,20 +176,22 @@ async def test_perplexity_search_passes_parameters(httpserver, monkeypatch):
 	httpserver.expect_request('/search', method='POST').respond_with_json(_search_payload())
 	_point_client_at(httpserver, monkeypatch)
 
-	result = await search_perplexity('fast query', max_results=3, search_type='fast')
+	result = await search_perplexity('fast query', max_results=3, search_type='fast', max_tokens_per_page=128)
 	assert result.error is None
 	request, _ = httpserver.log[-1]
 	assert json.loads(request.get_data()) == {
 		'query': 'fast query',
 		'max_results': 3,
 		'search_type': 'fast',
-		'max_tokens_per_page': 256,
+		'max_tokens_per_page': 128,
 	}
 
 	with pytest.raises(AssertionError):
 		await search_perplexity('too many', max_results=21)
 	with pytest.raises(AssertionError):
 		await search_perplexity('bad type', search_type='people')
+	with pytest.raises(AssertionError):
+		await search_perplexity('invalid token budget', max_tokens_per_page=0)
 
 
 async def test_perplexity_search_handles_empty_results(httpserver, monkeypatch):
@@ -208,13 +219,12 @@ async def test_perplexity_search_http_error_returns_friendly_error(httpserver, m
 
 
 async def test_perplexity_search_never_leaks_api_key(httpserver, monkeypatch, perplexity_log):
-	"""A key with a trailing newline is stripped and used as-is; a key that is still an illegal
+	"""A key with a trailing newline is stripped before use; a key that is still an illegal
 	header value makes httpx raise with the full Authorization header in the exception text,
 	which must not reach ActionResult.error or the logs."""
 	httpserver.expect_request('/search', method='POST').respond_with_json(_search_payload())
 	monkeypatch.setenv('PERPLEXITY_BASE_URL', httpserver.url_for('/').rstrip('/'))
 
-	# Trailing newline (common when the key is read from a file): stripped, request succeeds.
 	monkeypatch.setenv('PERPLEXITY_API_KEY', 'pplx-secret-trailing\n')
 	result = await search_perplexity('newline key')
 	assert result.error is None
@@ -246,8 +256,7 @@ async def test_perplexity_search_does_not_echo_response_body(httpserver, monkeyp
 	result = await search_perplexity('server error')
 
 	assert result.extracted_content is None
-	assert result.error == 'Failed to search Perplexity for "server error": HTTP 500 request failed'
-	assert sentinel not in result.error
+	assert result.error == 'Perplexity search failed: HTTP 500; check PERPLEXITY_BASE_URL; retry if the endpoint is correct'
 	assert sentinel not in perplexity_log.text
 	assert 'Perplexity Search API returned HTTP 500' in perplexity_log.text
 
@@ -255,7 +264,7 @@ async def test_perplexity_search_does_not_echo_response_body(httpserver, monkeyp
 @pytest.mark.parametrize(
 	('status', 'hint'),
 	[
-		(422, 'invalid request parameters'),
+		(422, 'check query, max_results, search_type, and max_tokens_per_page'),
 		(429, 'rate limited, retry later'),
 	],
 )
@@ -270,9 +279,7 @@ async def test_perplexity_search_422_and_429_use_fixed_hint(httpserver, monkeypa
 	result = await search_perplexity('error query')
 
 	assert result.extracted_content is None
-	assert result.error is not None
-	assert result.error == f'Failed to search Perplexity for "error query": HTTP {status} {hint}'
-	assert body_sentinel not in result.error
+	assert result.error == f'Perplexity search failed: HTTP {status}; {hint}'
 	assert body_sentinel not in perplexity_log.text
 	assert f'Perplexity Search API returned HTTP {status} ({hint})' in perplexity_log.text
 
@@ -287,10 +294,9 @@ async def test_perplexity_search_malformed_json_body(httpserver, monkeypatch, pe
 	result = await search_perplexity('bad body')
 
 	assert result.extracted_content is None
-	assert result.error == 'Failed to search Perplexity for "bad body": JSONDecodeError'
+	assert result.error == 'Perplexity search failed (JSONDecodeError); check PERPLEXITY_API_KEY and PERPLEXITY_BASE_URL.'
 	assert 'Perplexity Search API request failed: JSONDecodeError' in perplexity_log.text
 	for leaked in (body_sentinel, 'Expecting value', 'line 1'):
-		assert leaked not in result.error
 		assert leaked not in perplexity_log.text
 
 
@@ -303,10 +309,9 @@ async def test_perplexity_search_malformed_base_url(monkeypatch, perplexity_log)
 	result = await search_perplexity('bad base url')
 
 	assert result.extracted_content is None
-	assert result.error == 'Failed to search Perplexity for "bad base url": InvalidURL'
+	assert result.error == 'Perplexity search failed (InvalidURL); check PERPLEXITY_API_KEY and PERPLEXITY_BASE_URL.'
 	assert 'Perplexity Search API request failed: InvalidURL' in perplexity_log.text
 	for leaked in ('[::1', 'Invalid port', 'test-key'):
-		assert leaked not in result.error
 		assert leaked not in perplexity_log.text
 
 
@@ -320,14 +325,17 @@ async def test_perplexity_search_malformed_base_url(monkeypatch, perplexity_log)
 	],
 )
 async def test_perplexity_search_unexpected_response_shape(httpserver, monkeypatch, perplexity_log, payload):
-	"""A JSON body that is not {results: [dict, ...]} produces a fixed error, not a traceback."""
+	"""Reject non-dict bodies, non-list results, and non-dict result entries."""
 	httpserver.expect_request('/search', method='POST').respond_with_json(payload)
 	_point_client_at(httpserver, monkeypatch)
 
 	result = await search_perplexity('odd shape')
 
 	assert result.extracted_content is None
-	assert result.error == 'Failed to search Perplexity for "odd shape": unexpected response shape'
+	assert (
+		result.error
+		== 'Perplexity search returned an invalid response; verify PERPLEXITY_BASE_URL or contact Perplexity support.'
+	)
 	assert 'not a list' not in perplexity_log.text
 	assert 'string item' not in perplexity_log.text
 

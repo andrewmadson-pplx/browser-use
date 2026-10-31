@@ -21,8 +21,7 @@ async def search_perplexity(
 	no page navigation. Requires a ``PERPLEXITY_API_KEY`` environment variable.
 	``PERPLEXITY_BASE_URL`` overrides the API host (used by tests and proxies).
 
-	``max_tokens_per_page`` caps the snippet length per result. The API default is
-	much larger than an agent step needs, so a smaller value is sent by default.
+	The default requests up to 256 content tokens per result page; it is not a character limit.
 	"""
 	assert 1 <= max_results <= 20, 'max_results must be between 1 and 20'
 	assert search_type in ('web', 'fast'), "search_type must be 'web' or 'fast'"
@@ -30,7 +29,7 @@ async def search_perplexity(
 
 	api_key = os.environ.get('PERPLEXITY_API_KEY', '').strip()
 	if not api_key:
-		return ActionResult(error='PERPLEXITY_API_KEY environment variable not set')
+		return ActionResult(error='Set PERPLEXITY_API_KEY to use engine="perplexity".')
 
 	base_url = os.environ.get('PERPLEXITY_BASE_URL', 'https://api.perplexity.ai').rstrip('/')
 	headers = {
@@ -46,10 +45,7 @@ async def search_perplexity(
 		'max_tokens_per_page': max_tokens_per_page,
 	}
 
-	# Error messages below are deliberately fixed strings. Exception text is never
-	# interpolated: httpx errors (e.g. LocalProtocolError on a malformed header) and
-	# response bodies can echo request headers, including the Authorization value,
-	# and ActionResult.error ends up in agent history and logs.
+	# Exception text and response bodies can contain credentials; never log or return them.
 	try:
 		async with httpx.AsyncClient(timeout=30.0) as client:
 			response = await client.post(f'{base_url}/search', json=payload, headers=headers)
@@ -57,24 +53,27 @@ async def search_perplexity(
 			data = response.json()
 	except httpx.HTTPStatusError as e:
 		status = e.response.status_code
-		hint = {401: 'check PERPLEXITY_API_KEY', 422: 'invalid request parameters', 429: 'rate limited, retry later'}.get(
-			status, 'request failed'
-		)
+		hint = {
+			401: 'check PERPLEXITY_API_KEY',
+			422: 'check query, max_results, search_type, and max_tokens_per_page',
+			429: 'rate limited, retry later',
+		}.get(status, 'check PERPLEXITY_BASE_URL; retry if the endpoint is correct')
 		logger.error(f'Perplexity Search API returned HTTP {status} ({hint})')
-		return ActionResult(error=f'Failed to search Perplexity for "{query}": HTTP {status} {hint}')
+		return ActionResult(error=f'Perplexity search failed: HTTP {status}; {hint}')
 	except Exception as e:
-		# httpx.HTTPError (transport, timeout, protocol), httpx.InvalidURL (bad PERPLEXITY_BASE_URL,
-		# not an HTTPError subclass), ValueError (non-JSON body), and anything else: report the class
-		# name only, so no URL fragment or header value can reach the agent via the registry.
 		logger.error(f'Perplexity Search API request failed: {type(e).__name__}')
-		return ActionResult(error=f'Failed to search Perplexity for "{query}": {type(e).__name__}')
+		return ActionResult(
+			error=f'Perplexity search failed ({type(e).__name__}); check PERPLEXITY_API_KEY and PERPLEXITY_BASE_URL.'
+		)
 
 	results = data.get('results') if isinstance(data, dict) else None
 	if isinstance(data, dict) and results is None:
 		results = []
 	if not isinstance(results, list) or not all(isinstance(r, dict) for r in results):
 		logger.error('Perplexity Search API returned an unexpected response shape')
-		return ActionResult(error=f'Failed to search Perplexity for "{query}": unexpected response shape')
+		return ActionResult(
+			error='Perplexity search returned an invalid response; verify PERPLEXITY_BASE_URL or contact Perplexity support.'
+		)
 
 	memory = f"Searched Perplexity for '{query}' ({len(results)} results)"
 	if not results:

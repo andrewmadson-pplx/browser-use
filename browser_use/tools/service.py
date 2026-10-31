@@ -462,10 +462,6 @@ class Tools(Generic[Context]):
 			terminates_sequence=True,
 		)
 		async def search(params: SearchAction, browser_session: BrowserSession):
-			# Perplexity is an API-backed search engine: it returns structured
-			# results in a single API call instead of navigating the browser to a
-			# results page. Handle it before the browser-navigation engines below;
-			# google/bing/duckduckgo behavior is unchanged.
 			if params.engine.lower() == 'perplexity':
 				return await search_perplexity(params.query)
 
